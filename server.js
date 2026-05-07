@@ -1,6 +1,7 @@
 const express = require('express');
 const cors = require('cors');
 const jwt = require('jsonwebtoken');
+const bcrypt = require('bcryptjs');
 const multer = require('multer');
 const fs = require('fs');
 const path = require('path');
@@ -9,9 +10,8 @@ const { open } = require('sqlite');
 
 const app = express();
 const PORT = 3001;
-const JWT_SECRET = 'sn-consultancy-secret-key-2024';
+const JWT_SECRET = process.env.JWT_SECRET || 'sn-consultancy-secret-key-2024';
 
-// ============ SQLITE DATABASE SETUP ============
 let db;
 
 async function initDatabase() {
@@ -19,8 +19,7 @@ async function initDatabase() {
         filename: './sn_consultancy.db',
         driver: sqlite3.Database
     });
-    
-    // Create tables
+
     await db.exec(`
         CREATE TABLE IF NOT EXISTS Users (
             UserId INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -31,7 +30,7 @@ async function initDatabase() {
             IsActive INTEGER DEFAULT 1,
             CreatedAt DATETIME DEFAULT CURRENT_TIMESTAMP
         );
-        
+
         CREATE TABLE IF NOT EXISTS Assets (
             AssetId INTEGER PRIMARY KEY AUTOINCREMENT,
             AssetTag TEXT UNIQUE NOT NULL,
@@ -51,7 +50,7 @@ async function initDatabase() {
             CreatedAt DATETIME DEFAULT CURRENT_TIMESTAMP,
             UpdatedAt DATETIME DEFAULT CURRENT_TIMESTAMP
         );
-        
+
         CREATE TABLE IF NOT EXISTS Inspections (
             InspectionId INTEGER PRIMARY KEY AUTOINCREMENT,
             AssetId INTEGER,
@@ -64,7 +63,7 @@ async function initDatabase() {
             CreatedAt DATETIME DEFAULT CURRENT_TIMESTAMP,
             FOREIGN KEY (AssetId) REFERENCES Assets(AssetId)
         );
-        
+
         CREATE TABLE IF NOT EXISTS Documents (
             DocumentId INTEGER PRIMARY KEY AUTOINCREMENT,
             AssetId INTEGER,
@@ -78,32 +77,51 @@ async function initDatabase() {
             FOREIGN KEY (AssetId) REFERENCES Assets(AssetId)
         );
     `);
-    
-    // Insert default admin if not exists
+
+    // Migrate existing plaintext passwords to bcrypt hashes
+    const users = await db.all('SELECT * FROM Users');
+    for (const user of users) {
+        if (!user.PasswordHash.startsWith('$2')) {
+            const salt = await bcrypt.genSalt(10);
+            const hash = await bcrypt.hash(user.PasswordHash, salt);
+            await db.run('UPDATE Users SET PasswordHash = ? WHERE UserId = ?', [hash, user.UserId]);
+            console.log(`Upgraded password hash for user: ${user.Email}`);
+        }
+    }
+
+    // Seed default users if none exist
     const admin = await db.get('SELECT * FROM Users WHERE Email = ?', 'admin@snconsultancy.com');
     if (!admin) {
-        await db.run(`
-            INSERT INTO Users (Email, PasswordHash, FullName, Role) 
-            VALUES ('admin@snconsultancy.com', 'Admin123!', 'System Administrator', 'admin')
-        `);
-        console.log('✅ Default admin user created');
+        const salt = await bcrypt.genSalt(10);
+        const users = [
+            { email: 'admin@snconsultancy.com', password: 'Admin123!', name: 'System Administrator', role: 'admin' },
+            { email: 'manager@snconsultancy.com', password: 'pass123', name: 'Asset Manager', role: 'manager' },
+            { email: 'engineer@snconsultancy.com', password: 'pass123', name: 'Senior Engineer', role: 'engineer' },
+            { email: 'supervisor@snconsultancy.com', password: 'pass123', name: 'Site Supervisor', role: 'supervisor' }
+        ];
+        for (const u of users) {
+            const hash = await bcrypt.hash(u.password, salt);
+            await db.run('INSERT INTO Users (Email, PasswordHash, FullName, Role) VALUES (?, ?, ?, ?)',
+                [u.email, hash, u.name, u.role]);
+        }
+        console.log('Default users created with hashed passwords');
     }
-    
-    // Insert sample assets if none exist
+
+    // Seed sample assets if none exist
     const assetCount = await db.get('SELECT COUNT(*) as count FROM Assets');
     if (assetCount.count === 0) {
         await db.run(`
-            INSERT INTO Assets (AssetTag, AssetName, AssetType, Status, HealthPercentage, RemainingLifeDays, Manufacturer) 
-            VALUES 
+            INSERT INTO Assets (AssetTag, AssetName, AssetType, Status, HealthPercentage, RemainingLifeDays, Manufacturer)
+            VALUES
             ('B-101', 'Boiler B-101', 'boiler', 'operational', 85, 187, 'Foster Wheeler'),
             ('V-202', 'Pressure Vessel V-202', 'vessel', 'caution', 62, 94, 'Mitsubishi'),
             ('B-102', 'Boiler B-102', 'boiler', 'critical', 35, 45, 'Babcock'),
             ('H-305', 'Heat Exchanger H-305', 'exchanger', 'operational', 92, 312, 'Alfa Laval')
         `);
-        console.log('✅ Sample assets created');
+        console.log('Sample assets created');
     }
-    
-    console.log('✅ SQLite database initialized');
+
+    console.log('SQLite database initialized');
 }
 
 // ============ MIDDLEWARE ============
@@ -111,11 +129,9 @@ app.use(cors());
 app.use(express.json());
 app.use('/uploads', express.static('uploads'));
 
-// Create uploads folder
 const uploadDir = './uploads';
 if (!fs.existsSync(uploadDir)) {
     fs.mkdirSync(uploadDir);
-    console.log('📁 Created uploads directory');
 }
 
 const storage = multer.diskStorage({
@@ -142,26 +158,29 @@ async function authenticate(req, res, next) {
 // ============ AUTH ROUTES ============
 app.post('/api/login', async (req, res) => {
     const { email, password } = req.body;
-    console.log(`📧 Login attempt: ${email}`);
-    
+
+    if (!email || !password) {
+        return res.status(400).json({ error: 'Email and password are required' });
+    }
+
     try {
-        const user = await db.get('SELECT * FROM Users WHERE Email = ?', email);
-        
+        const user = await db.get('SELECT * FROM Users WHERE Email = ?', email.toLowerCase().trim());
+
         if (!user) {
-            return res.status(401).json({ error: 'Invalid credentials' });
+            return res.status(401).json({ error: 'Invalid email or password' });
         }
-        
-        if (password !== user.PasswordHash) {
-            return res.status(401).json({ error: 'Invalid credentials' });
+
+        const validPassword = await bcrypt.compare(password, user.PasswordHash);
+        if (!validPassword) {
+            return res.status(401).json({ error: 'Invalid email or password' });
         }
-        
+
         const token = jwt.sign(
             { userId: user.UserId, email: user.Email, role: user.Role },
             JWT_SECRET,
             { expiresIn: '24h' }
         );
-        
-        console.log(`✅ Login successful: ${email}`);
+
         res.json({
             token,
             user: {
@@ -173,11 +192,25 @@ app.post('/api/login', async (req, res) => {
         });
     } catch (err) {
         console.error('Login error:', err);
-        res.status(500).json({ error: err.message });
+        res.status(500).json({ error: 'Internal server error' });
     }
 });
 
 // ============ ASSETS ROUTES ============
+app.post('/api/assets', authenticate, async (req, res) => {
+    const { assetTag, assetName, assetType, manufacturer, installDate, designLifeYears, healthPercentage } = req.body;
+    try {
+        const result = await db.run(`
+            INSERT INTO Assets (AssetTag, AssetName, AssetType, Manufacturer, InstallDate, DesignLifeYears, HealthPercentage, CreatedBy)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        `, [assetTag, assetName, assetType, manufacturer, installDate, designLifeYears || 25, healthPercentage || 100, req.user.userId]);
+        const asset = await db.get('SELECT * FROM Assets WHERE AssetId = ?', result.lastID);
+        res.json(asset);
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
 app.get('/api/assets', authenticate, async (req, res) => {
     try {
         const assets = await db.all('SELECT * FROM Assets ORDER BY AssetName');
@@ -200,8 +233,8 @@ app.get('/api/assets/:id', authenticate, async (req, res) => {
 app.get('/api/inspections', authenticate, async (req, res) => {
     try {
         const inspections = await db.all(`
-            SELECT i.*, a.AssetName FROM Inspections i 
-            JOIN Assets a ON i.AssetId = a.AssetId 
+            SELECT i.*, a.AssetName FROM Inspections i
+            JOIN Assets a ON i.AssetId = a.AssetId
             ORDER BY i.InspectionDate DESC
         `);
         res.json(inspections);
@@ -227,8 +260,8 @@ app.post('/api/inspections', authenticate, async (req, res) => {
 app.get('/api/documents', authenticate, async (req, res) => {
     try {
         const documents = await db.all(`
-            SELECT d.*, a.AssetName FROM Documents d 
-            JOIN Assets a ON d.AssetId = a.AssetId 
+            SELECT d.*, a.AssetName FROM Documents d
+            JOIN Assets a ON d.AssetId = a.AssetId
             ORDER BY d.UploadedAt DESC
         `);
         res.json(documents);
@@ -238,14 +271,13 @@ app.get('/api/documents', authenticate, async (req, res) => {
 });
 
 app.post('/api/documents/upload', authenticate, upload.single('file'), async (req, res) => {
-    const { assetId, documentName, documentType } = req.body;
-    const file = req.file;
-    if (!file) return res.status(400).json({ error: 'No file uploaded' });
+    const { assetId, documentName, documentType, fileName } = req.body;
     try {
+        const fName = fileName || req.file?.originalname || 'document.pdf';
         await db.run(`
             INSERT INTO Documents (AssetId, DocumentName, DocumentType, FileName, FilePath, FileSizeBytes, UploadedBy)
             VALUES (?, ?, ?, ?, ?, ?, ?)
-        `, [assetId, documentName, documentType, file.originalname, file.path, file.size, req.user.userId]);
+        `, [assetId, documentName, documentType, fName, req.file?.path || '', req.file?.size || 0, req.user.userId]);
         res.json({ message: 'Document uploaded' });
     } catch (err) {
         res.status(500).json({ error: err.message });
@@ -260,7 +292,7 @@ app.get('/api/dashboard/stats', authenticate, async (req, res) => {
         const critical = await db.get("SELECT COUNT(*) as count FROM Assets WHERE Status = 'critical'");
         const avgHealth = await db.get('SELECT AVG(HealthPercentage) as avg FROM Assets');
         const totalInspections = await db.get('SELECT COUNT(*) as count FROM Inspections');
-        
+
         res.json({
             totalAssets: totalAssets.count,
             atRisk: atRisk.count,
@@ -283,12 +315,10 @@ async function start() {
     await initDatabase();
     app.listen(PORT, () => {
         console.log(`\n========================================`);
-        console.log(`🚀 SN Consultancy Backend Server (SQLite)`);
+        console.log(`SN Consultancy Backend Server`);
         console.log(`========================================`);
-        console.log(`📡 Server running on: http://localhost:${PORT}`);
-        console.log(`🔗 API endpoint: http://localhost:${PORT}/api`);
-        console.log(`🧪 Test API: http://localhost:${PORT}/api/health`);
-        console.log(`📁 Database file: ./sn_consultancy.db`);
+        console.log(`Server running on: http://localhost:${PORT}`);
+        console.log(`API endpoint: http://localhost:${PORT}/api`);
         console.log(`========================================\n`);
     });
 }
